@@ -1,0 +1,217 @@
+name: Mirror upstream releases
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: '15 */6 * * *'  # 每6小时自动运行一次（比同步代码晚15分钟）
+  repository_dispatch:
+    types: [new-release]  # 可以通过 API 触发
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: netcccyun/dnsmgr  # 上游仓库
+  TARGET_REPO: ${{ github.repository }}  # 目标仓库（自动使用当前仓库）
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+
+      - name: Setup GitHub CLI
+        run: |
+          gh --version || (echo "GitHub CLI not found" && exit 1)
+
+      - name: List upstream releases
+        id: upstream
+        run: |
+          echo "Fetching releases from ${{ env.UPSTREAM_REPO }}..."
+          # 获取所有 releases（分页）
+          releases_json=$(gh api -H 'Accept: application/vnd.github+json' \
+            "/repos/${{ env.UPSTREAM_REPO }}/releases?per_page=100" --paginate)
+          
+          # 保存到文件并计算总数
+          echo "$releases_json" > /tmp/upstream_releases.json
+          total=$(echo "$releases_json" | jq 'length')
+          echo "Found $total releases"
+          echo "total=$total" >> $GITHUB_OUTPUT
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl
+
+      - name: Mirror releases and assets
+        run: |
+          set -e
+          releases=$(cat /tmp/upstream_releases.json)
+          total=$(echo "$releases" | jq 'length')
+          
+          echo "Processing $total releases..."
+          
+          # 找出版本号最高的 release（用于设置 latest）
+          latest_tag=""
+          latest_version="0.0.0"
+          
+          for i in $(seq 0 $((total-1))); do
+            release=$(echo "$releases" | jq -r ".[$i]")
+            tag=$(echo "$release" | jq -r '.tag_name')
+            name=$(echo "$release" | jq -r '.name // .tag_name')
+            body=$(echo "$release" | jq -r '.body // ""')
+            draft=$(echo "$release" | jq -r '.draft')
+            prerelease=$(echo "$release" | jq -r '.prerelease')
+            
+            # 解析版本号（去掉 v 前缀）
+            tag_clean=$(echo "$tag" | sed 's/^[vV]//')
+            
+            echo ""
+            echo "========================================="
+            echo "Processing release: $tag"
+            echo "Name: $name"
+            echo "Draft: $draft, Prerelease: $prerelease"
+            echo "========================================="
+            
+            # 检查目标仓库是否已有此 release
+            if gh api --silent "/repos/${{ env.TARGET_REPO }}/releases/tags/$tag" >/dev/null 2>&1; then
+              echo "Release $tag already exists, updating..."
+              existing_release=$(gh api "/repos/${{ env.TARGET_REPO }}/releases/tags/$tag")
+              release_id=$(echo "$existing_release" | jq -r '.id')
+              
+              # 更新 release 信息
+              gh api -X PATCH \
+                -H "Content-Type: application/json; charset=utf-8" \
+                "/repos/${{ env.TARGET_REPO }}/releases/$release_id" \
+                -f name="$name" \
+                -f body="$body" \
+                -f draft="$draft" \
+                -f prerelease="$prerelease"
+              
+              echo "✅ Updated release: $tag"
+            else
+              echo "Creating new release: $tag"
+              
+              # 获取目标仓库主分支的 SHA（用于 target_commitish）
+              repo_info=$(gh api "/repos/${{ env.TARGET_REPO }}")
+              default_branch=$(echo "$repo_info" | jq -r '.default_branch')
+              branch_ref=$(gh api "/repos/${{ env.TARGET_REPO }}/git/ref/heads/$default_branch")
+              target_sha=$(echo "$branch_ref" | jq -r '.object.sha')
+              
+              # 创建 release
+              gh release create "$tag" \
+                --repo "${{ env.TARGET_REPO }}" \
+                --title "$name" \
+                --notes "$body" \
+                --target "$target_sha" \
+                $([ "$prerelease" = "true" ] && echo "--prerelease" || echo "") \
+                $([ "$draft" = "true" ] && echo "--draft" || echo "") || {
+                  echo "⚠️  Failed to create release $tag, skipping assets"
+                  continue
+                }
+              
+              echo "✅ Created release: $tag"
+            fi
+            
+            # 处理 assets
+            asset_count=$(echo "$release" | jq -r '.assets | length')
+            if [ "$asset_count" -gt 0 ]; then
+              echo "Found $asset_count assets for $tag"
+              
+              # 获取目标 release 的现有 assets（用于检查是否已存在）
+              target_release=$(gh api "/repos/${{ env.TARGET_REPO }}/releases/tags/$tag")
+              
+              # 遍历每个 asset
+              for i in $(seq 0 $((asset_count-1))); do
+                asset=$(echo "$release" | jq -r ".assets[$i]")
+                download_url=$(echo "$asset" | jq -r '.browser_download_url // .url // empty')
+                filename=$(echo "$asset" | jq -r '.name')
+                
+                if [ -z "$download_url" ] || [ "$download_url" = "null" ] || [ -z "$filename" ] || [ "$filename" = "null" ]; then
+                  echo "  ⚠️  Invalid asset data, skipping"
+                  continue
+                fi
+                
+                # 检查目标 release 是否已有此 asset
+                existing_asset_id=$(echo "$target_release" | jq -r ".assets[]? | select(.name==\"$filename\") | .id // empty")
+                if [ -n "$existing_asset_id" ] && [ "$existing_asset_id" != "null" ]; then
+                  echo "  ✓ Asset already exists: $filename"
+                  continue
+                fi
+                
+                echo "  ⬇️  Downloading: $filename"
+                if curl -L -f -s -o "/tmp/$filename" "$download_url"; then
+                  file_size=$(stat -f%z "/tmp/$filename" 2>/dev/null || stat -c%s "/tmp/$filename" 2>/dev/null || echo "0")
+                  if [ "$file_size" -gt 0 ]; then
+                    echo "  ⬆️  Uploading: $filename ($(numfmt --to=iec-i --suffix=B $file_size 2>/dev/null || echo "${file_size} bytes"))"
+                    if gh release upload "$tag" "/tmp/$filename" \
+                      --repo "${{ env.TARGET_REPO }}" \
+                      --clobber; then
+                      echo "  ✅ Uploaded: $filename"
+                      rm -f "/tmp/$filename"
+                      sleep 1  # 避免请求过快
+                    else
+                      echo "  ❌ Failed to upload: $filename"
+                      rm -f "/tmp/$filename"
+                    fi
+                  else
+                    echo "  ❌ Downloaded file is empty: $filename"
+                    rm -f "/tmp/$filename"
+                  fi
+                else
+                  echo "  ❌ Failed to download: $filename"
+                fi
+              done
+            else
+              echo "No assets for $tag"
+            fi
+            
+            # 更新最新版本记录（用于后续设置 latest）
+            if [ "$draft" != "true" ] && [ "$prerelease" != "true" ]; then
+              # 尝试解析版本号并比较
+              if command -v dpkg &> /dev/null; then
+                # 使用 dpkg --compare-versions 比较版本
+                if dpkg --compare-versions "$tag_clean" "gt" "$latest_version" 2>/dev/null; then
+                  latest_version="$tag_clean"
+                  latest_tag="$tag"
+                fi
+              else
+                # 简单的字符串比较（作为后备方案）
+                if [ "$tag_clean" \> "$latest_version" ]; then
+                  latest_version="$tag_clean"
+                  latest_tag="$tag"
+                fi
+              fi
+            fi
+            
+            echo "Sleeping 2 seconds before next release..."
+            sleep 2
+          done
+          
+          # 确保最新版本被标记为 latest
+          if [ -n "$latest_tag" ] && [ "$latest_tag" != "" ]; then
+            echo ""
+            echo "========================================="
+            echo "Setting latest release: $latest_tag"
+            echo "========================================="
+            
+            latest_release=$(gh api "/repos/${{ env.TARGET_REPO }}/releases/tags/$latest_tag")
+            latest_id=$(echo "$latest_release" | jq -r '.id')
+            
+            # 更新 published_at 到当前时间，确保它被标记为 latest
+            current_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            gh api -X PATCH \
+              -H "Content-Type: application/json; charset=utf-8" \
+              "/repos/${{ env.TARGET_REPO }}/releases/$latest_id" \
+              -f published_at="$current_time"
+            
+            echo "✅ Latest release updated: $latest_tag"
+          fi
+
+      - name: Summary
+        run: |
+          echo "✅ Release mirroring completed"
+          echo "Upstream: ${{ env.UPSTREAM_REPO }}"
+          echo "Target: ${{ env.TARGET_REPO }}"
+

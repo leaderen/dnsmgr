@@ -1,0 +1,89 @@
+name: Sync upstream code
+
+on:
+  workflow_dispatch:  # 允许手动触发
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时自动运行一次
+  push:
+    branches:
+      - main  # 如果主分支有推送，也触发同步检查
+
+permissions:
+  contents: write
+  pull-requests: read
+
+env:
+  UPSTREAM_REPO: netcccyun/dnsmgr  # 上游仓库
+  UPSTREAM_BRANCH: main  # 上游分支（如果是 master 请改为 master）
+  TARGET_BRANCH: main  # 目标分支
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史记录
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git || git remote set-url upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+      - name: Check for updates
+        id: check
+        run: |
+          git checkout ${{ env.TARGET_BRANCH }}
+          # 检查是否有新提交
+          if git merge-base --is-ancestor HEAD upstream/${{ env.UPSTREAM_BRANCH }}; then
+            # 当前分支已经是最新的
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "Already up-to-date with upstream"
+          else
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "New commits found in upstream"
+            echo "Current HEAD: $(git rev-parse HEAD)"
+            echo "Upstream HEAD: $(git rev-parse upstream/${{ env.UPSTREAM_BRANCH }})"
+          fi
+
+      - name: Merge upstream changes
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          git checkout ${{ env.TARGET_BRANCH }}
+          # 使用 theirs 策略，完全采用上游的更改
+          git merge --no-edit -s ours upstream/${{ env.UPSTREAM_BRANCH }} || true
+          git checkout --theirs .
+          git add -A
+          git commit -m "chore: sync from upstream/${{ env.UPSTREAM_BRANCH }}" || true
+
+      - name: Show differences
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          echo "=== File changes ==="
+          git diff --name-status HEAD~1 HEAD || true
+          echo "=== Change summary ==="
+          git diff --stat HEAD~1 HEAD || true
+
+      - name: Push changes
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          git fetch origin ${{ env.TARGET_BRANCH }}
+          # 使用 force-with-lease 安全推送
+          git push origin ${{ env.TARGET_BRANCH }} --force-with-lease
+
+      - name: Summary
+        if: steps.check.outputs.has_updates == 'true'
+        run: |
+          echo "✅ Successfully synced from upstream"
+          echo "Upstream: ${{ env.UPSTREAM_REPO }}"
+          echo "Branch: ${{ env.UPSTREAM_BRANCH }}"
+
