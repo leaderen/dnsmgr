@@ -3,7 +3,7 @@ name: Sync upstream code
 on:
   workflow_dispatch:  # 允许手动触发
   schedule:
-    - cron: '0 */6 * * *'  # 每6小时自动运行一次
+    - cron: '0 0 * * *'  # 每天午夜（00:00 UTC）自动运行一次
   push:
     branches:
       - main  # 如果主分支有推送，也触发同步检查
@@ -68,10 +68,22 @@ jobs:
       - name: Show differences
         if: steps.check.outputs.has_updates == 'true'
         run: |
-          echo "=== File changes ==="
+          echo ""
+          echo "========================================="
+          echo "📝 Changes Summary"
+          echo "========================================="
+          echo ""
+          echo "=== Changed Files ==="
           git diff --name-status HEAD~1 HEAD || true
-          echo "=== Change summary ==="
+          echo ""
+          echo "=== File Statistics ==="
           git diff --stat HEAD~1 HEAD || true
+          echo ""
+          echo "=== Commit Details ==="
+          echo "New commits from upstream:"
+          git log HEAD~1..HEAD --oneline --no-decorate || true
+          echo ""
+          echo "Total commits: $(git rev-list --count HEAD~1..HEAD || echo '0')"
 
       - name: Push changes
         if: steps.check.outputs.has_updates == 'true'

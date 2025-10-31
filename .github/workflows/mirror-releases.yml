@@ -3,7 +3,7 @@ name: Mirror upstream releases
 on:
   workflow_dispatch:  # 允许手动触发
   schedule:
-    - cron: '15 */6 * * *'  # 每6小时自动运行一次（比同步代码晚15分钟）
+    - cron: '0 0 * * *'  # 每天午夜（00:00 UTC）自动运行一次
   repository_dispatch:
     types: [new-release]  # 可以通过 API 触发
 
@@ -91,6 +91,9 @@ jobs:
           latest_tag=""
           latest_version="0.0.0"
           failed_count=0
+          created_releases=()
+          updated_releases=()
+          uploaded_assets=()
           
           for i in $(seq 0 $((total-1))); do
             set +e  # 在循环中允许错误
@@ -149,6 +152,7 @@ jobs:
               if [ $? -eq 0 ]; then
                 echo "✅ Updated release: $tag"
                 release_success=true
+                updated_releases+=("$tag")
               else
                 echo "⚠️  Failed to update release $tag"
                 failed_count=$((failed_count + 1))
@@ -192,6 +196,7 @@ jobs:
               if [ $? -eq 0 ]; then
                 echo "✅ Created release: $tag"
                 release_success=true
+                created_releases+=("$tag")
               else
                 echo "⚠️  Failed to create release $tag, skipping assets"
                 failed_count=$((failed_count + 1))
@@ -234,6 +239,7 @@ jobs:
                       --repo "${{ env.TARGET_REPO }}" \
                       --clobber; then
                       echo "  ✅ Uploaded: $filename"
+                      uploaded_assets+=("$tag:$filename")
                       rm -f "/tmp/$filename"
                       sleep 1  # 避免请求过快
                     else
@@ -277,11 +283,47 @@ jobs:
           # 输出处理总结
           echo ""
           echo "========================================="
-          echo "Processing Summary"
+          echo "📊 Processing Summary"
           echo "========================================="
-          echo "Total releases: $total"
+          echo "Total releases processed: $total"
           echo "Failed releases: $failed_count"
           echo "Succeeded releases: $((total - failed_count))"
+          echo ""
+          
+          # 显示创建的 releases
+          if [ ${#created_releases[@]} -gt 0 ]; then
+            echo "🆕 Created Releases (${#created_releases[@]}):"
+            for tag in "${created_releases[@]}"; do
+              echo "  - $tag"
+            done
+            echo ""
+          fi
+          
+          # 显示更新的 releases
+          if [ ${#updated_releases[@]} -gt 0 ]; then
+            echo "🔄 Updated Releases (${#updated_releases[@]}):"
+            for tag in "${updated_releases[@]}"; do
+              echo "  - $tag"
+            done
+            echo ""
+          fi
+          
+          # 显示上传的 assets
+          if [ ${#uploaded_assets[@]} -gt 0 ]; then
+            echo "📦 Uploaded Assets (${#uploaded_assets[@]}):"
+            for asset in "${uploaded_assets[@]}"; do
+              tag_name=$(echo "$asset" | cut -d':' -f1)
+              file_name=$(echo "$asset" | cut -d':' -f2-)
+              echo "  - $tag_name: $file_name"
+            done
+            echo ""
+          fi
+          
+          # 如果没有创建、更新或上传任何内容，说明没有新变化
+          if [ ${#created_releases[@]} -eq 0 ] && [ ${#updated_releases[@]} -eq 0 ] && [ ${#uploaded_assets[@]} -eq 0 ]; then
+            echo "✅ No changes detected - all releases and assets are up-to-date"
+            echo ""
+          fi
           
           # 如果所有 release 都失败了，退出并报错
           if [ "$failed_count" -eq "$total" ] && [ "$total" -gt 0 ]; then
