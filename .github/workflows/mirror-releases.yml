@@ -21,42 +21,77 @@ jobs:
       - name: Checkout target repository
         uses: actions/checkout@v4
 
-      - name: Setup GitHub CLI
-        run: |
-          gh --version || (echo "GitHub CLI not found" && exit 1)
-
-      - name: List upstream releases
-        id: upstream
-        run: |
-          echo "Fetching releases from ${{ env.UPSTREAM_REPO }}..."
-          # 获取所有 releases（分页）
-          releases_json=$(gh api -H 'Accept: application/vnd.github+json' \
-            "/repos/${{ env.UPSTREAM_REPO }}/releases?per_page=100" --paginate)
-          
-          # 保存到文件并计算总数
-          echo "$releases_json" > /tmp/upstream_releases.json
-          total=$(echo "$releases_json" | jq 'length')
-          echo "Found $total releases"
-          echo "total=$total" >> $GITHUB_OUTPUT
-
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq curl
 
+      - name: Verify GitHub CLI
+        run: |
+          gh --version || (echo "Error: GitHub CLI not found" && exit 1)
+
+      - name: List upstream releases
+        id: upstream
+        run: |
+          set +e  # 暂时允许错误，以便更好地处理
+          echo "Fetching releases from ${{ env.UPSTREAM_REPO }}..."
+          
+          # 获取所有 releases（分页）
+          releases_json=$(gh api -H 'Accept: application/vnd.github+json' \
+            "/repos/${{ env.UPSTREAM_REPO }}/releases?per_page=100" --paginate 2>&1)
+          
+          if [ $? -ne 0 ]; then
+            echo "Error fetching releases: $releases_json"
+            exit 1
+          fi
+          
+          # 检查 JSON 是否为空或无效
+          if [ -z "$releases_json" ] || [ "$releases_json" = "null" ] || [ "$releases_json" = "[]" ]; then
+            echo "Warning: No releases found or empty response"
+            releases_json="[]"
+          fi
+          
+          # 保存到文件
+          echo "$releases_json" > /tmp/upstream_releases.json
+          
+          # 验证 JSON 格式
+          if ! echo "$releases_json" | jq . >/dev/null 2>&1; then
+            echo "Error: Invalid JSON response"
+            echo "Response: $releases_json"
+            exit 1
+          fi
+          
+          # 计算总数
+          total=$(echo "$releases_json" | jq 'length')
+          echo "Found $total releases"
+          echo "total=$total" >> $GITHUB_OUTPUT
+          
+          if [ "$total" -eq 0 ]; then
+            echo "No releases to process"
+          fi
+          
+          set -e
+
       - name: Mirror releases and assets
         run: |
-          set -e
+          set +e  # 允许错误，以便单个 release 失败不影响其他 release
           releases=$(cat /tmp/upstream_releases.json)
           total=$(echo "$releases" | jq 'length')
+          
+          if [ "$total" -eq 0 ]; then
+            echo "No releases to process, exiting"
+            exit 0
+          fi
           
           echo "Processing $total releases..."
           
           # 找出版本号最高的 release（用于设置 latest）
           latest_tag=""
           latest_version="0.0.0"
+          failed_count=0
           
           for i in $(seq 0 $((total-1))); do
+            set +e  # 在循环中允许错误
             release=$(echo "$releases" | jq -r ".[$i]")
             tag=$(echo "$release" | jq -r '.tag_name')
             name=$(echo "$release" | jq -r '.name // .tag_name')
@@ -74,11 +109,31 @@ jobs:
             echo "Draft: $draft, Prerelease: $prerelease"
             echo "========================================="
             
+            # 检查必需字段
+            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+              echo "⚠️  Skipping release with invalid tag"
+              failed_count=$((failed_count + 1))
+              continue
+            fi
+            
+            release_success=false
+            
             # 检查目标仓库是否已有此 release
             if gh api --silent "/repos/${{ env.TARGET_REPO }}/releases/tags/$tag" >/dev/null 2>&1; then
               echo "Release $tag already exists, updating..."
-              existing_release=$(gh api "/repos/${{ env.TARGET_REPO }}/releases/tags/$tag")
+              existing_release=$(gh api "/repos/${{ env.TARGET_REPO }}/releases/tags/$tag" 2>&1)
+              if [ $? -ne 0 ]; then
+                echo "⚠️  Failed to fetch existing release $tag"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
+              
               release_id=$(echo "$existing_release" | jq -r '.id')
+              if [ -z "$release_id" ] || [ "$release_id" = "null" ]; then
+                echo "⚠️  Invalid release ID for $tag"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
               
               # 更新 release 信息
               gh api -X PATCH \
@@ -87,17 +142,41 @@ jobs:
                 -f name="$name" \
                 -f body="$body" \
                 -f draft="$draft" \
-                -f prerelease="$prerelease"
+                -f prerelease="$prerelease" 2>&1
               
-              echo "✅ Updated release: $tag"
+              if [ $? -eq 0 ]; then
+                echo "✅ Updated release: $tag"
+                release_success=true
+              else
+                echo "⚠️  Failed to update release $tag"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
             else
               echo "Creating new release: $tag"
               
               # 获取目标仓库主分支的 SHA（用于 target_commitish）
-              repo_info=$(gh api "/repos/${{ env.TARGET_REPO }}")
+              repo_info=$(gh api "/repos/${{ env.TARGET_REPO }}" 2>&1)
+              if [ $? -ne 0 ]; then
+                echo "⚠️  Failed to fetch repo info for $tag"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
+              
               default_branch=$(echo "$repo_info" | jq -r '.default_branch')
-              branch_ref=$(gh api "/repos/${{ env.TARGET_REPO }}/git/ref/heads/$default_branch")
+              branch_ref=$(gh api "/repos/${{ env.TARGET_REPO }}/git/ref/heads/$default_branch" 2>&1)
+              if [ $? -ne 0 ]; then
+                echo "⚠️  Failed to fetch branch info for $tag"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
+              
               target_sha=$(echo "$branch_ref" | jq -r '.object.sha')
+              if [ -z "$target_sha" ] || [ "$target_sha" = "null" ]; then
+                echo "⚠️  Invalid SHA for $tag"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
               
               # 创建 release
               gh release create "$tag" \
@@ -106,12 +185,16 @@ jobs:
                 --notes "$body" \
                 --target "$target_sha" \
                 $([ "$prerelease" = "true" ] && echo "--prerelease" || echo "") \
-                $([ "$draft" = "true" ] && echo "--draft" || echo "") || {
-                  echo "⚠️  Failed to create release $tag, skipping assets"
-                  continue
-                }
+                $([ "$draft" = "true" ] && echo "--draft" || echo "") 2>&1
               
-              echo "✅ Created release: $tag"
+              if [ $? -eq 0 ]; then
+                echo "✅ Created release: $tag"
+                release_success=true
+              else
+                echo "⚠️  Failed to create release $tag, skipping assets"
+                failed_count=$((failed_count + 1))
+                continue
+              fi
             fi
             
             # 处理 assets
@@ -188,6 +271,21 @@ jobs:
             echo "Sleeping 2 seconds before next release..."
             sleep 2
           done
+          
+          # 输出处理总结
+          echo ""
+          echo "========================================="
+          echo "Processing Summary"
+          echo "========================================="
+          echo "Total releases: $total"
+          echo "Failed releases: $failed_count"
+          echo "Succeeded releases: $((total - failed_count))"
+          
+          # 如果所有 release 都失败了，退出并报错
+          if [ "$failed_count" -eq "$total" ] && [ "$total" -gt 0 ]; then
+            echo "❌ All releases failed"
+            exit 1
+          fi
           
           # 确保最新版本被标记为 latest
           if [ -n "$latest_tag" ] && [ "$latest_tag" != "" ]; then
