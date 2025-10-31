@@ -13,6 +13,7 @@ permissions:
 env:
   UPSTREAM_REPO: netcccyun/dnsmgr  # 上游仓库
   TARGET_REPO: ${{ github.repository }}  # 目标仓库（自动使用当前仓库）
+  GH_TOKEN: ${{ github.token }}  # GitHub CLI 需要的 token（自动提供）
 
 jobs:
   mirror:
@@ -26,9 +27,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq curl
 
-      - name: Verify GitHub CLI
+      - name: Setup GitHub CLI
         run: |
           gh --version || (echo "Error: GitHub CLI not found" && exit 1)
+          # GitHub CLI 会自动使用 GH_TOKEN 环境变量
 
       - name: List upstream releases
         id: upstream
